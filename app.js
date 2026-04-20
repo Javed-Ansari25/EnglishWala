@@ -5,6 +5,7 @@ import morgan from 'morgan';
 import path from 'path';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import cookieParser from 'cookie-parser';
 
 // Load env
 dotenv.config();
@@ -24,6 +25,7 @@ app.use(cors({
 // ── Body Parser ────────────────────────
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cookieParser());
 
 // ── Logger ────────────────────────────
 if (process.env.NODE_ENV !== 'production') {
@@ -42,6 +44,9 @@ app.get('/health', (req, res) => {
 });
 
 // ── Routes ────────────────────────────
+import authRouter from './src/routes/authRoutes.js'
+
+app.use("/api/auth", authRouter);
 
 
 // ── Global Error Handler ──────────────
