@@ -22,13 +22,14 @@ const generateTokens = async (userId, res) => {
 
   // Refresh token DB mein save 
   await User.findByIdAndUpdate(userId, { refreshToken });
-
-  // Refresh token httpOnly cookie 
-  res.cookie('refreshToken', refreshToken, {
+  const cookieOptions = {
     httpOnly: true,
     secure:  true,
-    sameSite: 'none',
-  });
+    sameSite: 'none'
+  }
+
+  res.cookie("accessToken", accessToken, cookieOptions);
+  res.cookie("refreshToken", refreshToken, cookieOptions  );
 
   return accessToken;
 };
@@ -37,7 +38,7 @@ const generateTokens = async (userId, res) => {
 const refreshAccessToken = async (req, res) => {
   try {
     // Cookie se refresh token 
-    const token = req.cookies?.refreshToken;
+    const token = req.cookies?.refreshToken || req.body.refreshToken;
 
     if (!token) {
       return res.status(401).json({ success: false, message: 'Refresh token not found' });
