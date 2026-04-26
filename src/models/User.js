@@ -10,8 +10,6 @@ const userSchema = new mongoose.Schema(
     profilePhoto: { type: String, default: '' },
     googleId: { type: String, sparse: true },
     isVerified: { type: Boolean, default: false },
-    otp: { type: String, select: false },
-    otpExpiry: { type: Date, select: false },
     role: { type: String, enum: ['user', 'admin'], default: 'user' },
     englishLevel: {
       type: String,

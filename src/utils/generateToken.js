@@ -1,79 +1,110 @@
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
+import redisClient from '../config/redis.js';
+import { ApiError, ApiResponse } from './sendResponse&Error.js';
+import { asyncHandler } from './asyncHandler.js';
 
-// ── Access Token generate 
-const generateAccessToken = (id) => {
-  return jwt.sign({ id }, process.env.ACCESS_TOKEN_SECRET, {
-    expiresIn: process.env.ACCESS_TOKEN_EXPIRY || '25m',
-  });
+const cookieOptions = {
+  httpOnly: true,
+  secure: true,
+  sameSite: "none",
 };
 
-// ── Refresh Token generate 
-const generateRefreshToken = (id) => {
-  return jwt.sign({ id }, process.env.REFRESH_TOKEN_SECRET, {
-    expiresIn: process.env.REFRESH_TOKEN_EXPIRY || '7d',
-  });
+export const generateAccessToken = (id) => {
+  return jwt.sign(
+    { id },
+    process.env.ACCESS_TOKEN_SECRET,
+    { expiresIn: "15m" }
+  );
 };
 
-// ── Dono tokens generate 
-const generateTokens = async (userId, res) => {
-  const accessToken  = generateAccessToken(userId);
+
+export const generateRefreshToken = (id) => {
+  return jwt.sign(
+    { id },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: "7d" }
+  );
+};
+
+
+export const generateTokens = async (userId, res) => {
+  const accessToken = generateAccessToken(userId);
   const refreshToken = generateRefreshToken(userId);
 
-  // Refresh token DB mein save 
-  await User.findByIdAndUpdate(userId, { refreshToken });
-  const cookieOptions = {
-    httpOnly: true,
-    secure:  true,
-    sameSite: 'none'
-  }
+  // Save refresh token in Redis
+  await redisClient.set(`refreshToken:${userId}`, refreshToken, "EX",7 * 24 * 60 * 60);
 
   res.cookie("accessToken", accessToken, cookieOptions);
-  res.cookie("refreshToken", refreshToken, cookieOptions  );
+  res.cookie("refreshToken", refreshToken, cookieOptions);
 
   return accessToken;
 };
 
+
+export const clearTokens = async (userId, res) => {
+  await redisClient.del(`refreshToken:${userId}`);
+
+  res.clearCookie("accessToken", cookieOptions);
+  res.clearCookie("refreshToken", cookieOptions);
+}
+
+
 // ── Refresh Token se naya Access Token 
-const refreshAccessToken = async (req, res) => {
-  try {
-    // Cookie se refresh token 
-    const token = req.cookies?.refreshToken || req.body.refreshToken;
+export const refreshAccessToken = asyncHandler(async (req, res) => {
+  const token = req.cookies?.refreshToken || req.body?.refreshToken;
 
-    if (!token) {
-      return res.status(401).json({ success: false, message: 'Refresh token not found' });
-    }
-
-    // Refresh token verify 
-    let decoded;
-    try {
-      decoded = jwt.verify(token, process.env.REFRESH_TOKEN_SECRET);
-    } catch {
-      return res.status(401).json({ success: false, message: 'Refresh token expire, Please Again login' });
-    }
-
-    // DB mein check karo — token match karta hai ya nahi
-    const user = await User.findById(decoded.id).select('+refreshToken');
-
-    if (!user) {
-      return res.status(401).json({ success: false, message: 'User nahi mila' });
-    }
-
-    if (user.refreshToken !== token) {
-      return res.status(401).json({ success: false, message: 'Refresh token invalid hai' });
-    }
-
-    // Naya access token banaya
-    const newAccessToken = generateAccessToken(user._id);
-
-    return res.status(200).json({
-      success:     true,
-      accessToken: newAccessToken,
-    });
-
-  } catch (error) {
-    return res.status(500).json({ success: false, message: 'Server error' });
+  if (!token) {
+    throw new ApiError(401, "Refresh token is required");
   }
-};
 
-export { generateAccessToken, generateRefreshToken, generateTokens, refreshAccessToken };
+  let decoded;
+
+  try {
+    decoded = jwt.verify(
+      token,
+      process.env.REFRESH_TOKEN_SECRET
+    );
+  } catch (error) {
+    throw new ApiError(
+      401,
+      "Refresh token expired or invalid"
+    );
+  }
+
+  const storedToken = await redisClient.get(
+    `refreshToken:${decoded.id}`
+  );
+
+  if (!storedToken) {
+    throw new ApiError(
+      401,
+      "Session expired. Please login again"
+    );
+  }
+
+  if (storedToken !== token) {
+    throw new ApiError(
+      401,
+      "Invalid refresh token"
+    );
+  }
+
+  const newAccessToken = generateAccessToken(decoded.id);
+
+  res.cookie("accessToken", newAccessToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+  });
+
+  return res.status(200).json(
+    new ApiResponse(
+      200,
+      {
+        accessToken: newAccessToken,
+      },
+      "New access token generated successfully"
+    )
+  );
+});

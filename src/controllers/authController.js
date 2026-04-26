@@ -1,8 +1,10 @@
 import jwt from "jsonwebtoken";
+import bcrypt from 'bcryptjs';
 import User from "../models/User.js";
+import redisClient from "../config/redis.js";
 
 import { asyncHandler } from "../utils/asyncHandler.js";
-import { generateTokens } from "../utils/generateToken.js";
+import { generateTokens, clearTokens } from "../utils/generateToken.js";
 import { ApiError, ApiResponse } from "../utils/sendResponse&Error.js";
 import { sendEmailOTP } from "../services/emailService.js";
 import { generateOTP } from "../utils/generateOTP.js";
@@ -13,110 +15,145 @@ const register = asyncHandler(async (req, res) => {
   const { name, email, mobile, password } = req.body;
 
   if (!name || !email || !password) {
-    throw new ApiError(400, "Name, email, and password are required");
+    throw new ApiError(400, "All fields are required");
   }
 
   const existingUser = await User.findOne({ email });
   if (existingUser) {
-    throw new ApiError(409, "Email is already registered");
+    throw new ApiError(409, "Email already registered");
   }
 
   const otp = generateOTP();
+  const hashedOtp = await bcrypt.hash(otp, 10);
+   
 
-  const user = await User.create({
+  // Store FULL DATA in Redis
+  await redisClient.set(
+  `signup:${email}`,
+  JSON.stringify({
     name,
     email,
     mobile,
     password,
-    otp,
-    otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
-  });
+    hashedOtp,
+    attempts: 0,
+  }),
+  "EX",
+  300
+);
 
-  await sendEmailOTP(email, otp);
+  try {
+    await sendEmailOTP(email, otp);
+  } catch (error) {
+    await redisClient.del(`signup:${email}`);
+    throw new ApiError(500, "Failed to send OTP");
+  }
 
-  return res.status(201).json(
-    new ApiResponse(
-      201,
-      { userId: user._id },
-      "User registered successfully. OTP sent to email"
-    )
+  return res.status(200).json(
+    new ApiResponse(200, { email }, "OTP sent for registration")
   );
 });
 
 // ── VERIFY OTP 
 const verifyOTP = asyncHandler(async (req, res) => {
-  const { userId, otp } = req.body;
+  const { email, otp } = req.body;
+  if (!otp) throw new ApiError(400, "OTP required");
 
-  if (!userId || !otp) {
-    throw new ApiError(400, "User ID and OTP are required");
+  const data = await redisClient.get(`signup:${email}`);
+  if (!data) throw new ApiError(400, "OTP expired");
+
+  let userData = JSON.parse(data);
+
+  if (userData.attempts >= 5) {
+    throw new ApiError(429, "Too many attempts");
   }
 
-  const user = await User.findById(userId).select("+otp +otpExpiry");
+  const isMatch = await bcrypt.compare(otp, userData.hashedOtp);
 
-  if (!user) throw new ApiError(404, "User not found");
+  if (!isMatch) {
+    userData.attempts += 1;
 
-  if (user.isVerified) {
-    throw new ApiError(400, "User is already verified");
-  }
+    await redisClient.set(
+  `signup:${email}`,
+  JSON.stringify(userData),
+  "EX",
+  300
+);
 
-  if (user.otp !== otp) {
     throw new ApiError(400, "Invalid OTP");
   }
 
-  if (user.otpExpiry < new Date()) {
-    throw new ApiError(400, "OTP has expired");
-  }
+  // Create user
+  const user = await User.create({
+    name: userData.name,
+    email: userData.email,
+    mobile: userData.mobile,
+    password: userData.password,
+    isVerified: true,
+  });
 
-  user.isVerified = true;
-  user.otp = undefined;
-  user.otpExpiry = undefined;
+  await Promise.all([
+    redisClient.del(`signup:${email}`),
+    generateTokens(user._id, res)
+  ])
 
-  await user.save();
-
-  const accessToken = await generateTokens(user._id, res);
-
-  return res.status(200).json(
+  return res.status(201).json(
     new ApiResponse(
-      200,
+      201,
       {
-        user: {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-        },
+        _id: user._id,
+        name: user.name,
+        email: user.email,
       },
-      "Email verified successfully"
+      "Registration successful"
     )
   );
 });
 
 // ── RESEND OTP 
 const resendOTP = asyncHandler(async (req, res) => {
-  const { userId } = req.body;
+  const { email } = req.body;
 
-  if (!userId) {
-    throw new ApiError(400, "User ID is required");
+  const key = `signup:${email.toLowerCase().trim()}`;
+  const resendKey = `resend:${email.toLowerCase().trim()}`;
+
+  const data = await redisClient.get(key);
+  if (!data) throw new ApiError(400, "Session expired");
+
+  const isCooldown = await redisClient.get(resendKey);
+  if (isCooldown) {
+    throw new ApiError(429, "Please wait before requesting another OTP");
   }
 
-  const user = await User.findById(userId);
+  const userData = JSON.parse(data);
 
-  if (!user) throw new ApiError(404, "User not found");
+  const newOTP = generateOTP();
+  const hashedOtp = await bcrypt.hash(newOTP, 10);
 
-  if (user.isVerified) {
-    throw new ApiError(400, "User is already verified");
-  }
+  await sendEmailOTP(email, newOTP);
 
-  const otp = generateOTP();
+  userData.hashedOtp = hashedOtp;
+  userData.attempts = 0;
 
-  user.otp = otp;
-  user.otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+  const ttl = await redisClient.ttl(key);
 
-  await user.save();
-
-  await sendEmailOTP(user.email, otp);
+await Promise.all([
+  redisClient.set(
+    key,
+    JSON.stringify(userData),
+    "EX",
+    ttl > 0 ? ttl : 300
+  ),
+  redisClient.set(
+    resendKey,
+    "true",
+    "EX",
+    60
+  )
+]);
 
   return res.status(200).json(
-    new ApiResponse(200, {}, "New OTP sent successfully")
+    new ApiResponse(200, {}, "OTP resent successfully")
   );
 });
 
@@ -125,34 +162,38 @@ const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    throw new ApiError(400, "Email and password are required");
+    throw new ApiError(400, "Email and password required");
   }
 
   const user = await User.findOne({ email }).select("+password");
+
+  if (!user) {
+    throw new ApiError(401, "Invalid email or password");
+  }
+
   const isMatch = await user.matchPassword(password);
 
-  if (!user || !isMatch) {
+  if (!isMatch) {
     throw new ApiError(401, "Invalid email or password");
   }
 
   if (!user.isVerified) {
-    throw new ApiError(403, "Please verify your email before logging in");
+    throw new ApiError(403, "Email not verified");
   }
 
   if (user.isBlocked) {
-    throw new ApiError(403, "Your account has been blocked");
+    throw new ApiError(403, "Account blocked");
   }
 
-  const accessToken = await generateTokens(user._id, res);
+  await generateTokens(user._id, res);
 
   return res.status(200).json(
     new ApiResponse(
       200,
       {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
       },
       "Login successful"
     )
@@ -161,76 +202,20 @@ const login = asyncHandler(async (req, res) => {
 
 // ── LOGOUT 
 const logout = asyncHandler(async (req, res) => {
-  await User.findByIdAndUpdate(req.user._id, {
-    refreshToken: null,
-  });
+  const token = req.cookies?.accessToken;
 
-  const cookieOption = {
-    httpOnly: true,
-    secure:  true,
-    sameSite: 'none'
+  if (token) {
+    await redisClient.set(`bl:${token}`, "true", "EX", 3600);
   }
 
-  res.clearCookie("refreshToken", cookieOption);
+  await clearTokens(req.user._id, res);
 
   return res.status(200).json(
     new ApiResponse(200, {}, "Logged out successfully")
   );
 });
 
-// ── FORGOT PASSWORD
-const forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
-
-  if (!email) {
-    throw new ApiError(400, "Email is required");
-  }
-
-  const user = await User.findOne({ email });
-
-  if (!user) throw new ApiError(404, "User not found");
-
-  const otp = generateOTP();
-
-  user.otp = otp;
-  user.otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
-
-  await user.save();
-
-  await sendEmailOTP(email, otp);
-
-  return res.status(200).json(
-    new ApiResponse(
-      200,
-      { userId: user._id },
-      "Password reset OTP sent to email"
-    )
-  );
-});
-
-// ── CHANGE PASSWORD 
-const changePassword = asyncHandler(async (req, res) => {
-  const { oldPassword, newPassword } = req.body;
-
-  if (!oldPassword || !newPassword) {
-    throw new ApiError(400, "Old password and new password are required");
-  }
-
-  const user = await User.findById(req.user._id).select("+password");
-  const isMatch = await user.matchPassword(oldPassword);
-
-  if (!isMatch) {
-    throw new ApiError(400, "Old password is incorrect");
-  }
-
-  user.password = newPassword;
-  await user.save();
-
-  return res.status(200).json(
-    new ApiResponse(200, {}, "Password changed successfully")
-  );
-});
-
+// ── GetCurrentUser
 const getCurrentUser = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id);
 
@@ -253,7 +238,5 @@ export {
   resendOTP,
   login,
   logout,
-  getCurrentUser,
-  forgotPassword,
-  changePassword,
+  getCurrentUser
 };

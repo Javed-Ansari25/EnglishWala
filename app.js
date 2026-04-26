@@ -43,6 +43,10 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ── Global API RATE-LIMIT  ──────────────
+import { globalRateLimiter } from './src/middleware/Ratelimit.Middleware.js';
+app.use(globalRateLimiter);
+
 // ── Routes ────────────────────────────
 import authRouter from './src/routes/authRoutes.js'
 
