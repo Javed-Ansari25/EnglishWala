@@ -25,22 +25,22 @@ const register = asyncHandler(async (req, res) => {
 
   const otp = generateOTP();
   const hashedOtp = await bcrypt.hash(otp, 10);
-   
 
-  // Store FULL DATA in Redis
-  await redisClient.set(
-  `signup:${email}`,
-  JSON.stringify({
+  const userData = {
     name,
     email,
     mobile,
     password,
     hashedOtp,
     attempts: 0,
-  }),
-  "EX",
-  300
-);
+  }
+
+  // Store FULL DATA in Redis
+  await redisClient.set(`signup:${email}`,
+    JSON.stringify(userData),
+    "EX",
+    300
+  );
 
   try {
     await sendEmailOTP(email, otp);
@@ -74,11 +74,11 @@ const verifyOTP = asyncHandler(async (req, res) => {
     userData.attempts += 1;
 
     await redisClient.set(
-  `signup:${email}`,
-  JSON.stringify(userData),
-  "EX",
-  300
-);
+      `signup:${email}`,
+      JSON.stringify(userData),
+      "EX",
+      300
+    );
 
     throw new ApiError(400, "Invalid OTP");
   }
@@ -217,7 +217,7 @@ const logout = asyncHandler(async (req, res) => {
 
 // ── GetCurrentUser
 const getCurrentUser = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const user = await User.findById(req?.user?._id);
 
   if (!user) {
     throw new ApiError(404, "User not found");
